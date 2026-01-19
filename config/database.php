@@ -1,6 +1,6 @@
 <?php
 
-// ===== AMBIENTE {teste2} =====
+// ===== AMBIENTE {teste3} =====
 // 'teste' | 'producao'
 $env = 'producao';
 
