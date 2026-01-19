@@ -283,6 +283,8 @@ class SyncService
                     }
                 }
 
+                
+
                 $retryCount = 0;
                 if (count($items) < 50) break;
                 $pauseTime = ($this->clientPlan === 'enterprise') ? 200000 : 500000;
