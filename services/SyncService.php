@@ -282,6 +282,7 @@ class SyncService
                         sleep($waitTime);
                     }
                 }
+                
 
                 $retryCount = 0;
                 if (count($items) < 50) break;
