@@ -19,14 +19,10 @@ class SyncService
     private $entityId;
     private $entityType;
     private $tableBaseName;
-    private $webhookUrl;
-    private $entityInfo;
 
     public function __construct($clientKey, $webhookUrl, $entityInfo, $clientPlan = 'others')
     {
         $this->clientKey = $clientKey;
-        $this->webhookUrl = $webhookUrl;
-        $this->entityInfo = $entityInfo;
         $this->clientPlan = strtolower($clientPlan);
         $this->entityType = $entityInfo['type'] ?? 'spa';
         $this->entityId = $entityInfo['id'] ?? null;
@@ -38,76 +34,6 @@ class SyncService
         $this->mapping = new MappingService($clientKey, $webhookUrl, $entityInfo);
     }
 
-    /**
-     * Executa a Sincronização Incremental (Rápida)
-     */
-    public function runIncremental($hours = 10)
-    {
-        $startTime = date('H:i:s');
-        try {
-            // 1. Limpeza de Deletados
-            $this->syncDeleted();
-
-            // 2. Atualização de Novos e Editados
-            $timeAgo = date('Y-m-d\TH:i:s', strtotime("-{$hours} hours")) . "-03:00";
-            $dateField = ($this->entityType === 'task') ? 'changedDate' : 'updatedTime';
-            
-            $this->syncData([">{$dateField}" => $timeAgo]);
-            
-            // 3. Checagem de Integridade
-            $bitrixTotal = $this->getBitrixTotal();
-            $localTotal = $this->getLocalTotal();
-
-            if ($localTotal < $bitrixTotal) {
-                echo "\n[ALERTA] Banco incompleto ({$localTotal} < {$bitrixTotal}). Disparando Carga Bruta...\n";
-                return $this->runFull();
-            }
-
-            $this->log($this->tableBaseName, $startTime, $localTotal, "OK", "(Incremental)");
-            return true;
-        } catch (Exception $e) {
-            $this->log($this->tableBaseName, $startTime, 0, "ERRO", $e->getMessage());
-            return false;
-        }
-    }
-
-    /**
-     * Executa a Carga Bruta (Completa com Re-tentativa)
-     */
-    public function runFull($attempt = 1)
-    {
-        $startTime = date('H:i:s');
-        $maxAttempts = 2;
-
-        try {
-            $this->syncData([]);
-            
-            $bitrixTotal = $this->getBitrixTotal();
-            $localTotal = $this->getLocalTotal();
-            $diff = abs($bitrixTotal - $localTotal);
-
-            if ($diff == 0) {
-                $this->log($this->tableBaseName, $startTime, $localTotal, "OK");
-                return true;
-            } elseif ($diff <= 20) {
-                $this->syncData(['>ID' => 0]); 
-                $localTotal = $this->getLocalTotal();
-                $this->log($this->tableBaseName, $startTime, $localTotal, "OK", "(Ajustado +$diff)");
-                return true;
-            } else {
-                if ($attempt < $maxAttempts) {
-                    echo "[Tentativa {$attempt}] Divergência alta ({$diff}). Reiniciando...\n";
-                    return $this->runFull($attempt + 1);
-                }
-                $this->log($this->tableBaseName, $startTime, $localTotal, "ERRO", "Divergência persistente ({$diff})");
-                return false;
-            }
-        } catch (Exception $e) {
-            $this->log($this->tableBaseName, $startTime, 0, "ERRO", $e->getMessage());
-            return false;
-        }
-    }
-
     public function log($entity, $start, $total, $status, $extra = '')
     {
         $now = date('H:i:s');
@@ -117,7 +43,6 @@ class SyncService
         $msg = "[{$date} {$now}] {$client} | {$entity} | INÍCIO: {$start} | FIM: {$now} | TOTAL: {$total} | STATUS: {$status} {$extra}\n";
         
         echo $msg;
-        // Caminho absoluto para o log na raiz do projeto
         $logPath = dirname(__DIR__) . DIRECTORY_SEPARATOR . 'sync.log';
         file_put_contents($logPath, $msg, FILE_APPEND);
     }
@@ -138,47 +63,8 @@ class SyncService
         return (int)$this->pdo->query("SELECT count(*) FROM \"{$physicalTable}\"")->fetchColumn();
     }
 
-    public function syncDeleted()
-    {
-        $allBitrixIds = [];
-        $lastId = 0;
-        $method = ($this->entityType === 'company') ? 'crm.company.list' : (($this->entityType === 'task') ? 'tasks.task.list' : 'crm.item.list');
-        $idKey = ($this->entityType === 'company') ? 'ID' : 'id';
-
-        do {
-            $params = ['select' => ['id'], 'filter' => [">{$idKey}" => $lastId], 'order' => ['id' => 'asc']];
-            if ($this->entityId) $params['entityTypeId'] = $this->entityId;
-            
-            $res = $this->bitrix->call($method, $params);
-            $items = $res['result']['items'] ?? $res['result']['tasks'] ?? $res['result'] ?? [];
-            if (empty($items)) break;
-
-            foreach ($items as $item) {
-                $id = $item['ID'] ?? $item['id'] ?? null;
-                if ($id) {
-                    $allBitrixIds[] = (int)$id;
-                    $lastId = (int)$id;
-                }
-            }
-        } while (count($items) == 50);
-
-        $physicalTable = "tbl_" . $this->tableBaseName;
-        $this->cleanupDeletedRecords($allBitrixIds, $physicalTable);
-        return count($allBitrixIds);
-    }
-
-    public function tableExists()
-    {
-        $physicalTable = "tbl_" . $this->tableBaseName;
-        $stmt = $this->pdo->prepare("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = ?)");
-        $stmt->execute([$physicalTable]);
-        return (bool)$stmt->fetchColumn();
-    }
-
     public function syncData($filters = [], $limit = null)
     {
-        $isIncremental = !empty($filters);
-
         // 1. Garante que o índice e o schema físico estão 100%
         $this->mapping->syncFieldMapping();
         $schema = new SchemaService($this->clientKey, $this->mapping);
@@ -202,6 +88,9 @@ class SyncService
 
         if (!in_array('ID', $selectFields)) $selectFields[] = 'ID';
         if (!in_array('id', $selectFields)) $selectFields[] = 'id';
+
+        // 3. Configuração da Sincronização Sequencial
+        echo "\n[" . date('d/m/Y H:i:s') . "] Iniciando sincronização de " . strtoupper($this->tableBaseName) . "...\n";
 
         $lastId = 0;
         $totalProcessed = 0;
@@ -261,9 +150,8 @@ class SyncService
                     $this->saveItem($item, $fieldMap, $physicalTable);
                     $totalProcessed++;
 
-                    // Feedback de progresso para tabelas grandes no modo incremental
-                    if ($isIncremental && $totalProcessed % 500 === 0) {
-                        echo "[Progresso] {$totalProcessed} registros processados...\n";
+                    if ($totalProcessed % 2500 === 0) {
+                        echo "[" . date('H:i:s') . "] Progresso: {$totalProcessed} registros processados | Último ID: {$bitrixId}\n";
                     }
 
                     if ($limit && $totalProcessed >= $limit) break 2;
@@ -282,7 +170,6 @@ class SyncService
                         sleep($waitTime);
                     }
                 }
-
 
                 $retryCount = 0;
                 if (count($items) < 50) break;
