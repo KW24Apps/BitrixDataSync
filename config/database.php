@@ -1,8 +1,8 @@
 <?php
 
-// ===== AMBIENTE {tes3} =====
+// ===== AMBIENTE {tes4} =====
 // 'teste' | 'producao'
-$env = 'producao';
+$env = 'teste';
 
 $config = [
 
